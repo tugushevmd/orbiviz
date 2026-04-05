@@ -6,28 +6,92 @@ import sys
 from pathlib import Path
 
 
-def _cmd_charge(args: argparse.Namespace) -> None:
-    from ._io import read_charge_csv
-    from ._geometry import read_xyz
-    from .charge_map import render_ranked_charge_map
+CHARGE_SCHEMES = ["mulliken", "loewdin", "chelpg", "nbo", "apt", "npa"]
 
-    charge_rows = read_charge_csv(Path(args.charges_csv), args.charge_column)
-    if args.xyz:
-        atoms = read_xyz(Path(args.xyz))
+
+def _select_charges(result: dict, scheme: str, source_label: str) -> list[dict]:
+    charges = result.get("charges", {})
+    if not charges:
+        raise ValueError(f"{source_label} does not contain atomic charges.")
+    if scheme not in charges:
+        available = ", ".join(sorted(charges))
+        raise ValueError(
+            f"{source_label} does not contain {scheme!r} charges. Available: {available}"
+        )
+    return charges[scheme]
+
+
+def _atoms_from_output_result(result: dict, xyz_override: str) -> list[dict]:
+    from ._geometry import read_xyz
+
+    if xyz_override:
+        return read_xyz(Path(xyz_override))
+    atoms = result.get("atoms", [])
+    if not atoms:
+        raise ValueError("No geometry found in the parsed output file.")
+    return atoms
+
+
+def _build_fukui_rows(
+    neutral_rows: list[dict],
+    anion_rows: list[dict],
+    cation_rows: list[dict],
+) -> list[dict]:
+    neutral = {row["atom_index"]: row for row in neutral_rows}
+    anion = {row["atom_index"]: row for row in anion_rows}
+    cation = {row["atom_index"]: row for row in cation_rows}
+
+    indices = sorted(neutral)
+    if set(indices) != set(anion) or set(indices) != set(cation):
+        raise ValueError("Charge tables for neutral, anion, and cation do not match.")
+
+    rows = []
+    for idx in indices:
+        q_n = neutral[idx]["charge"]
+        q_np1 = anion[idx]["charge"]
+        q_nm1 = cation[idx]["charge"]
+        f_plus = q_n - q_np1
+        f_minus = q_nm1 - q_n
+        rows.append(
+            {
+                "atom_index": idx,
+                "element": neutral[idx]["element"],
+                "f_plus": f_plus,
+                "f_minus": f_minus,
+                "dual_descriptor": f_plus - f_minus,
+            }
+        )
+    return rows
+
+
+def _cmd_charge(args: argparse.Namespace) -> None:
+    from .charge_map import render_ranked_charge_map
+    from ._geometry import read_xyz
+    from ._io import read_charge_csv
+    from ._parsers import auto_parse
+
+    if args.input_file:
+        result = auto_parse(Path(args.input_file))
+        charge_rows = _select_charges(result, args.charge_scheme, str(args.input_file))
+        atoms = _atoms_from_output_result(result, args.xyz)
     else:
-        atoms = []
-        for row in charge_rows:
-            if not {"x", "y", "z"} <= set(row):
-                raise ValueError("CSV must contain x/y/z columns if --xyz is not provided.")
-            atoms.append(
-                {
-                    "atom_index": row["atom_index"],
-                    "element": row["element"],
-                    "x": row["x"],
-                    "y": row["y"],
-                    "z": row["z"],
-                }
-            )
+        charge_rows = read_charge_csv(Path(args.charges_csv), args.charge_column)
+        if args.xyz:
+            atoms = read_xyz(Path(args.xyz))
+        else:
+            atoms = []
+            for row in charge_rows:
+                if not {"x", "y", "z"} <= set(row):
+                    raise ValueError("CSV must contain x/y/z columns if --xyz is not provided.")
+                atoms.append(
+                    {
+                        "atom_index": row["atom_index"],
+                        "element": row["element"],
+                        "x": row["x"],
+                        "y": row["y"],
+                        "z": row["z"],
+                    }
+                )
     render_ranked_charge_map(
         atoms, charge_rows, Path(args.output),
         title=args.title, subtitle=args.subtitle, top_count=args.top_count,
@@ -36,12 +100,46 @@ def _cmd_charge(args: argparse.Namespace) -> None:
 
 
 def _cmd_fukui(args: argparse.Namespace) -> None:
-    from ._io import read_fukui_csv
-    from ._geometry import read_xyz
     from .fukui_map import render_condensed_fukui
+    from ._geometry import read_xyz
+    from ._io import read_fukui_csv
+    from ._parsers import auto_parse
 
-    atoms = read_xyz(Path(args.xyz))
-    fukui_rows = read_fukui_csv(Path(args.indices_csv))
+    csv_mode = bool(args.indices_csv)
+    output_mode = bool(args.neutral_file or args.anion_file or args.cation_file)
+
+    if csv_mode and output_mode:
+        raise ValueError("Choose either CSV input or output-driven Fukui input, not both.")
+
+    if csv_mode:
+        if not args.xyz:
+            raise ValueError("--xyz is required with --indices-csv.")
+        atoms = read_xyz(Path(args.xyz))
+        fukui_rows = read_fukui_csv(Path(args.indices_csv))
+    else:
+        missing = [
+            name for name, value in [
+                ("--neutral-file", args.neutral_file),
+                ("--anion-file", args.anion_file),
+                ("--cation-file", args.cation_file),
+            ]
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "For direct Fukui generation provide all of "
+                "--neutral-file, --anion-file, and --cation-file."
+            )
+        neutral_result = auto_parse(Path(args.neutral_file))
+        anion_result = auto_parse(Path(args.anion_file))
+        cation_result = auto_parse(Path(args.cation_file))
+        atoms = _atoms_from_output_result(neutral_result, args.xyz)
+        fukui_rows = _build_fukui_rows(
+            _select_charges(neutral_result, args.charge_scheme, str(args.neutral_file)),
+            _select_charges(anion_result, args.charge_scheme, str(args.anion_file)),
+            _select_charges(cation_result, args.charge_scheme, str(args.cation_file)),
+        )
+
     render_condensed_fukui(
         atoms, fukui_rows, args.metric, Path(args.output),
         title=args.title, label_count=args.label_count,
@@ -70,9 +168,20 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- charge ---
     p_charge = sub.add_parser("charge", help="Render a ranked atomic charge map.")
-    p_charge.add_argument("--charges-csv", required=True, help="CSV with charges.")
+    charge_input = p_charge.add_mutually_exclusive_group(required=True)
+    charge_input.add_argument("--charges-csv", help="CSV with charges.")
+    charge_input.add_argument(
+        "--input-file",
+        help="Gaussian/ORCA/NBO text output to parse directly.",
+    )
     p_charge.add_argument("--xyz", default="", help="Optional XYZ geometry file.")
     p_charge.add_argument("--charge-column", default="adch_charge", help="Charge column name.")
+    p_charge.add_argument(
+        "--charge-scheme",
+        default="mulliken",
+        choices=CHARGE_SCHEMES,
+        help="Charge scheme used with --input-file.",
+    )
     p_charge.add_argument("--output", required=True, help="Output PNG path.")
     p_charge.add_argument("--title", default="Charge Map", help="Figure title.")
     p_charge.add_argument("--subtitle", default="Only the most charged atoms are numbered")
@@ -81,8 +190,21 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- fukui ---
     p_fukui = sub.add_parser("fukui", help="Render a condensed Fukui index map.")
-    p_fukui.add_argument("--xyz", required=True, help="XYZ geometry file.")
-    p_fukui.add_argument("--indices-csv", required=True, help="CSV with Fukui indices.")
+    p_fukui.add_argument(
+        "--xyz",
+        default="",
+        help="XYZ geometry file. Required with --indices-csv; optional override for output-driven mode.",
+    )
+    p_fukui.add_argument("--indices-csv", help="CSV with Fukui indices.")
+    p_fukui.add_argument("--neutral-file", help="Neutral Gaussian/ORCA output.")
+    p_fukui.add_argument("--anion-file", help="Anion (N+1) Gaussian/ORCA output.")
+    p_fukui.add_argument("--cation-file", help="Cation (N-1) Gaussian/ORCA output.")
+    p_fukui.add_argument(
+        "--charge-scheme",
+        default="mulliken",
+        choices=CHARGE_SCHEMES,
+        help="Charge scheme used with direct output input.",
+    )
     p_fukui.add_argument("--metric", required=True, choices=["f_plus", "f_minus", "dual_descriptor"])
     p_fukui.add_argument("--output", required=True, help="Output PNG path.")
     p_fukui.add_argument("--title", default="")
@@ -214,7 +336,7 @@ def _cmd_auto(args: argparse.Namespace) -> None:
         print(f"Bond orders: {len(result['bond_orders'])} significant bonds")
     if "cube" in result:
         shape = result["cube"]["shape"]
-        print(f"Grid:    {shape[0]}×{shape[1]}×{shape[2]}")
+        print(f"Grid:    {shape[0]}x{shape[1]}x{shape[2]}")
 
 
 if __name__ == "__main__":

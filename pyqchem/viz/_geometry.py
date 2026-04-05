@@ -1,7 +1,6 @@
 """Geometry utilities: XYZ/cube readers, bond detection, 2D projection."""
 from __future__ import annotations
 
-import io
 import math
 from pathlib import Path
 
@@ -99,10 +98,16 @@ def read_cube(path: Path) -> dict:
             }
         )
 
-    # Volumetric data — use np.loadtxt on the remaining lines
+    # Cube volumetric data is whitespace-separated but line-wrapped arbitrarily,
+    # so parse it as a flat stream rather than assuming a fixed column count.
     data_text = "".join(lines[6 + natoms :])
-    data = np.loadtxt(io.StringIO(data_text))
-    grid = data.ravel().reshape((nx, ny, nz))
+    data = np.fromstring(data_text, sep=" ")
+    expected = nx * ny * nz
+    if data.size != expected:
+        raise ValueError(
+            f"Cube grid size mismatch in {path}: expected {expected} values, got {data.size}"
+        )
+    grid = data.reshape((nx, ny, nz))
 
     return {
         "origin": origin,

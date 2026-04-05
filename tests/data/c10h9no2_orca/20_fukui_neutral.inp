@@ -1,0 +1,11 @@
+# Neutral density for condensed Fukui indices.
+! B3LYP D3BJ def2-SVP def2/J RIJCOSX TightSCF
+! Mulliken Loewdin Mayer XYZFile KEEPDENS
+
+%maxcore 2000
+
+%pal
+  nprocs 8
+end
+
+* xyzfile 0 1 c10h9no2_opt.xyz

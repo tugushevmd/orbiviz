@@ -24,6 +24,16 @@ from ._elements import Z_TO_SYMBOL, ELEMENTS
 BOHR_TO_ANG = 0.52917721067
 
 
+def _read_text_file(path: Path) -> str:
+    """Read a text file while tolerating common Windows shell encodings."""
+    data = Path(path).read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig")
+    return data.decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
 # Gaussian .log / .out parser
 # ---------------------------------------------------------------------------
@@ -33,7 +43,7 @@ class GaussianLogParser:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._text = self.path.read_text(encoding="utf-8", errors="replace")
+        self._text = _read_text_file(self.path)
         self._lines = self._text.splitlines()
 
     def get_geometry(self, which: str = "last") -> list[dict]:
@@ -175,7 +185,7 @@ class FchkParser:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+        self._lines = _read_text_file(self.path).splitlines()
         self._index: dict[str, int] = {}
         self._build_index()
 
@@ -281,7 +291,7 @@ class OrcaOutputParser:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._text = self.path.read_text(encoding="utf-8", errors="replace")
+        self._text = _read_text_file(self.path)
         self._lines = self._text.splitlines()
 
     def get_geometry(self, which: str = "last") -> list[dict]:
@@ -339,8 +349,12 @@ class OrcaOutputParser:
         return self._parse_orca_charge_block("MULLIKEN ATOMIC CHARGES")
 
     def get_loewdin_charges(self) -> list[dict]:
-        """Extract Löwdin atomic charges."""
+        """Extract Loewdin atomic charges."""
         return self._parse_orca_charge_block("LOEWDIN ATOMIC CHARGES")
+
+    def get_chelpg_charges(self) -> list[dict]:
+        """Extract CHELPG atomic charges."""
+        return self._parse_orca_charge_block("CHELPG Charges")
 
     def get_mayer_bond_orders(self) -> list[dict]:
         """Extract Mayer bond order matrix.
@@ -390,7 +404,7 @@ class NboOutputParser:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._text = self.path.read_text(encoding="utf-8", errors="replace")
+        self._text = _read_text_file(self.path)
         self._lines = self._text.splitlines()
 
     def get_npa_charges(self) -> list[dict]:
@@ -456,7 +470,7 @@ class MoldenParser:
 
     def __init__(self, path: Path):
         self.path = Path(path)
-        self._text = self.path.read_text(encoding="utf-8", errors="replace")
+        self._text = _read_text_file(self.path)
         self._lines = self._text.splitlines()
 
     def get_geometry(self) -> list[dict]:
@@ -561,7 +575,7 @@ def auto_parse(path: str | Path) -> dict:
         result["parser"] = parser
 
     elif suffix in (".log", ".out", ".g09", ".g16"):
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = _read_text_file(path)
 
         # NBO standalone output (NBO 6.0 / 7.0)
         if "NBO" in text[:500] and "N A T U R A L" in text[:500]:
@@ -593,6 +607,7 @@ def auto_parse(path: str | Path) -> dict:
             # Try to get charges
             for method, getter in [
                 ("mulliken", parser.get_mulliken_charges),
+                ("apt", parser.get_apt_charges),
                 ("nbo", parser.get_nbo_charges),
                 ("chelpg", parser.get_chelpg_charges),
             ]:
@@ -615,6 +630,7 @@ def auto_parse(path: str | Path) -> dict:
             for method, getter in [
                 ("mulliken", parser.get_mulliken_charges),
                 ("loewdin", parser.get_loewdin_charges),
+                ("chelpg", parser.get_chelpg_charges),
             ]:
                 try:
                     charges = getter()

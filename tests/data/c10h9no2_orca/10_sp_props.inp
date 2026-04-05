@@ -1,0 +1,31 @@
+# Property run at the optimized geometry.
+# Expected outputs:
+# - ORCA .out with Mulliken / Loewdin / Mayer / CHELPG analysis
+# - XYZ coordinate file
+# - electron-density cube
+# - HOMO / LUMO cubes
+# - molden file via: orca_2mkl 10_sp_props -molden
+#
+# Note:
+# For C10H9NO2, charge 0 / multiplicity 1 gives 92 electrons -> 46 occupied MOs.
+# Therefore HOMO=46 and LUMO=47 in the closed-shell reference.
+! B3LYP D3BJ def2-SVP def2/J RIJCOSX TightSCF
+! Mulliken Loewdin Mayer CHELPG XYZFile KEEPDENS
+
+%maxcore 2000
+
+%pal
+  nprocs 8
+end
+
+%plots
+  dim1 80
+  dim2 80
+  dim3 80
+  Format Gaussian_Cube
+  ElDens("c10h9no2_density.cube");
+  MO("c10h9no2_homo.cube",46,0);
+  MO("c10h9no2_lumo.cube",47,0);
+end
+
+* xyzfile 0 1 c10h9no2_opt.xyz
