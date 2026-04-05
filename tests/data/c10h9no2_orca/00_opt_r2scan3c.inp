@@ -1,0 +1,14 @@
+# Cheap, stable geometry optimization for fixture generation.
+! r2SCAN-3c Opt TightSCF TightOpt XYZFile
+
+%maxcore 2000
+
+%pal
+  nprocs 8
+end
+
+%geom
+  MaxIter 200
+end
+
+* xyzfile 0 1 c10h9no2_initial.xyz
