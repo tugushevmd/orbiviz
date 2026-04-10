@@ -68,9 +68,11 @@ def read_cube(path: Path) -> dict:
     with path.open("r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
-    # Line 3: natoms, origin
+    # Line 3: natoms (negative if file contains MO data), origin
     parts2 = lines[2].split()
-    natoms = int(parts2[0])
+    natoms_signed = int(parts2[0])
+    natoms = abs(natoms_signed)
+    has_mo_header = natoms_signed < 0
     origin = np.array([float(x) for x in parts2[1:4]], dtype=float)
 
     # Lines 4-6: grid vectors
@@ -98,9 +100,15 @@ def read_cube(path: Path) -> dict:
             }
         )
 
+    data_start = 6 + natoms
+    if has_mo_header:
+        # When natoms is negative, the line after the atom block lists the
+        # number of MOs followed by their indices. Skip exactly that line.
+        data_start += 1
+
     # Cube volumetric data is whitespace-separated but line-wrapped arbitrarily,
     # so parse it as a flat stream rather than assuming a fixed column count.
-    data_text = "".join(lines[6 + natoms :])
+    data_text = "".join(lines[data_start:])
     data = np.fromstring(data_text, sep=" ")
     expected = nx * ny * nz
     if data.size != expected:

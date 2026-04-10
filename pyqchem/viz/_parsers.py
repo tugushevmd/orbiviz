@@ -87,8 +87,41 @@ class GaussianLogParser:
         return atoms
 
     def get_mulliken_charges(self) -> list[dict]:
-        """Extract Mulliken atomic charges."""
-        return self._parse_charge_block("Mulliken charges:", skip_header=1)
+        """Extract Mulliken atomic charges (closed- or open-shell)."""
+        try:
+            return self._parse_charge_block("Mulliken charges:", skip_header=1)
+        except ValueError:
+            # Open-shell Gaussian uses "Mulliken charges and spin densities:"
+            return self._parse_charge_block(
+                "Mulliken charges and spin densities:", skip_header=1
+            )
+
+    def get_mulliken_spin_populations(self) -> list[dict]:
+        """Extract Mulliken spin populations from an open-shell Gaussian log."""
+        idx = None
+        for i, line in enumerate(self._lines):
+            if "Mulliken charges and spin densities:" in line:
+                idx = i
+        if idx is None:
+            raise ValueError(f"No Mulliken spin densities in {self.path}")
+        rows: list[dict] = []
+        for line in self._lines[idx + 2:]:
+            parts = line.split()
+            if len(parts) < 4:
+                break
+            try:
+                atom_idx = int(parts[0])
+                spin = float(parts[3])
+            except (ValueError, IndexError):
+                break
+            rows.append({
+                "atom_index": atom_idx,
+                "element": parts[1],
+                "spin": spin,
+            })
+        if not rows:
+            raise ValueError(f"Empty Mulliken spin block in {self.path}")
+        return rows
 
     def get_apt_charges(self) -> list[dict]:
         """Extract APT atomic charges."""
@@ -321,7 +354,11 @@ class OrcaOutputParser:
         return atoms
 
     def _parse_orca_charge_block(self, header: str) -> list[dict]:
-        """Generic parser for ORCA charge blocks (Mulliken, Löwdin)."""
+        """Generic parser for ORCA charge blocks (Mulliken, Löwdin).
+
+        Handles both ``CHARGES`` and ``CHARGES AND SPIN POPULATIONS`` blocks.
+        For the latter, both ``charge`` and ``spin`` keys are populated.
+        """
         idx = None
         for i, line in enumerate(self._lines):
             if header in line:
@@ -329,20 +366,49 @@ class OrcaOutputParser:
         if idx is None:
             raise ValueError(f"No '{header}' found in {self.path}")
         rows = []
-        charge_re = re.compile(r"\s*(\d+)\s+(\w+)\s*:\s*([-.\d]+)")
+        charge_re = re.compile(
+            r"\s*(\d+)\s+(\w+)\s*:\s*([-.\d]+)(?:\s+([-.\d]+))?"
+        )
         for line in self._lines[idx + 1:]:
             m = charge_re.match(line)
             if m:
-                rows.append({
+                row = {
                     "atom_index": int(m.group(1)) + 1,  # ORCA is 0-based
                     "element": m.group(2),
                     "charge": float(m.group(3)),
-                })
+                }
+                if m.group(4) is not None:
+                    row["spin"] = float(m.group(4))
+                rows.append(row)
             elif rows:
                 # Already found data, non-matching line = end of block
                 break
             # Skip separator lines (---) before data starts
         return rows
+
+    def get_mulliken_spin_populations(self) -> list[dict]:
+        """Return Mulliken spin populations (open-shell only)."""
+        rows = self._parse_orca_charge_block("MULLIKEN ATOMIC CHARGES AND SPIN")
+        spin_rows = [
+            {"atom_index": r["atom_index"], "element": r["element"],
+             "spin": r.get("spin", 0.0)}
+            for r in rows
+        ]
+        if not any("spin" in r for r in rows):
+            raise ValueError("No Mulliken spin populations found.")
+        return spin_rows
+
+    def get_loewdin_spin_populations(self) -> list[dict]:
+        """Return Loewdin spin populations (open-shell only)."""
+        rows = self._parse_orca_charge_block("LOEWDIN ATOMIC CHARGES AND SPIN")
+        spin_rows = [
+            {"atom_index": r["atom_index"], "element": r["element"],
+             "spin": r.get("spin", 0.0)}
+            for r in rows
+        ]
+        if not any("spin" in r for r in rows):
+            raise ValueError("No Loewdin spin populations found.")
+        return spin_rows
 
     def get_mulliken_charges(self) -> list[dict]:
         """Extract Mulliken atomic charges."""
@@ -459,6 +525,239 @@ class NboOutputParser:
             if "Job title:" in line:
                 return line.split("Job title:")[1].strip()
         return ""
+
+
+# ---------------------------------------------------------------------------
+# NWChem output parser
+# ---------------------------------------------------------------------------
+
+class NwchemOutputParser:
+    """Parse an NWChem output file for geometry, charges, and energy.
+
+    Recognised blocks:
+    - ``Geometry "geometry" -> "geometry"`` (XYZ table in Å)
+    - ``Total Mulliken charge``  / ``Mulliken analysis of the total density``
+    - ``Total ESP charge``       / ``ESP``
+    - ``Total Lowdin charge``
+    - ``Total DFT energy`` / ``Total SCF energy``
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._text = _read_text_file(self.path)
+        self._lines = self._text.splitlines()
+
+    def get_geometry(self, which: str = "last") -> list[dict]:
+        # NWChem prints "Output coordinates in angstroms" then a header line
+        # then a separator, then "  No.   Tag  Charge      X      Y      Z"
+        markers = [
+            i for i, line in enumerate(self._lines)
+            if "Output coordinates in angstroms" in line
+            or "Geometry " in line and "->" in line
+        ]
+        if not markers:
+            raise ValueError(f"No geometry found in {self.path}")
+        idx = markers[-1] if which == "last" else markers[0]
+        # Skip ahead until the column header line
+        start = None
+        for j in range(idx, min(idx + 20, len(self._lines))):
+            if "Tag" in self._lines[j] and ("Charge" in self._lines[j]
+                                            or "X" in self._lines[j]):
+                start = j + 2  # skip the header and the dashed separator
+                break
+        if start is None:
+            raise ValueError(f"Could not locate geometry table in {self.path}")
+        atoms: list[dict] = []
+        idx_counter = 0
+        for line in self._lines[start:]:
+            parts = line.split()
+            if len(parts) < 6:
+                if atoms:
+                    break
+                continue
+            try:
+                # Columns: No  Tag  Charge  X  Y  Z
+                int(parts[0])
+                x = float(parts[3])
+                y = float(parts[4])
+                z = float(parts[5])
+            except (ValueError, IndexError):
+                if atoms:
+                    break
+                continue
+            idx_counter += 1
+            atoms.append({
+                "atom_index": idx_counter,
+                "element": parts[1],
+                "x": x, "y": y, "z": z,
+            })
+        if not atoms:
+            raise ValueError(f"Empty geometry block in {self.path}")
+        return atoms
+
+    def _parse_population_block(self, header: str) -> list[dict]:
+        idx = None
+        for i, line in enumerate(self._lines):
+            if header in line:
+                idx = i
+        if idx is None:
+            raise ValueError(f"No '{header}' found in {self.path}")
+        rows: list[dict] = []
+        # NWChem prints something like:
+        #     1 C    6     6.080  ->   -0.080
+        #     2 H    1     0.940  ->    0.060
+        # The columns vary; rely on the trailing float being the charge.
+        row_re = re.compile(r"^\s*(\d+)\s+([A-Za-z]{1,2})\b.*?([-+]?\d+\.\d+)\s*$")
+        for line in self._lines[idx + 1: idx + 4000]:
+            m = row_re.match(line)
+            if m:
+                rows.append({
+                    "atom_index": int(m.group(1)),
+                    "element": m.group(2),
+                    "charge": float(m.group(3)),
+                })
+            elif rows:
+                # End of contiguous block
+                if not line.strip():
+                    continue
+                if rows and not row_re.match(line):
+                    # Allow a couple of blank lines, but a non-matching content
+                    # line ends the block.
+                    if any(c.isalpha() for c in line):
+                        break
+        return rows
+
+    def get_mulliken_charges(self) -> list[dict]:
+        return self._parse_population_block("Mulliken analysis of the total density")
+
+    def get_esp_charges(self) -> list[dict]:
+        return self._parse_population_block("ESP")
+
+    def get_lowdin_charges(self) -> list[dict]:
+        return self._parse_population_block("Lowdin Population Analysis")
+
+    def get_energy(self) -> float:
+        for key in ("Total DFT energy", "Total SCF energy", "Total CCSD(T) energy"):
+            pattern = re.compile(re.escape(key) + r"\s*=\s*([-.\d]+)")
+            matches = pattern.findall(self._text)
+            if matches:
+                return float(matches[-1])
+        raise ValueError(f"No total energy found in {self.path}")
+
+
+# ---------------------------------------------------------------------------
+# Q-Chem output parser
+# ---------------------------------------------------------------------------
+
+class QchemOutputParser:
+    """Parse a Q-Chem output file for geometry, charges, and energy.
+
+    Recognised blocks:
+    - ``Standard Nuclear Orientation (Angstroms)``
+    - ``Ground-State Mulliken Net Atomic Charges``
+    - ``Ground-State ChElPG Net Atomic Charges``
+    - ``Hirshfeld Atomic Charges``
+    - ``Total energy in the final basis set =``
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._text = _read_text_file(self.path)
+        self._lines = self._text.splitlines()
+
+    def get_geometry(self, which: str = "last") -> list[dict]:
+        markers = [
+            i for i, line in enumerate(self._lines)
+            if "Standard Nuclear Orientation" in line
+        ]
+        if not markers:
+            raise ValueError(f"No geometry found in {self.path}")
+        idx = markers[-1] if which == "last" else markers[0]
+        # Header is two lines below, then dashed separator, then atoms
+        start = idx + 3
+        atoms: list[dict] = []
+        for line in self._lines[start:]:
+            parts = line.split()
+            if len(parts) < 5:
+                break
+            if parts[0].startswith("-") or "Nuclear" in line:
+                break
+            try:
+                a_idx = int(parts[0])
+                x = float(parts[2])
+                y = float(parts[3])
+                z = float(parts[4])
+            except (ValueError, IndexError):
+                break
+            atoms.append({
+                "atom_index": a_idx,
+                "element": parts[1],
+                "x": x, "y": y, "z": z,
+            })
+        if not atoms:
+            raise ValueError(f"Empty geometry in {self.path}")
+        return atoms
+
+    def _parse_qchem_charge_block(self, header: str) -> list[dict]:
+        idx = None
+        for i, line in enumerate(self._lines):
+            if header in line:
+                idx = i
+        if idx is None:
+            raise ValueError(f"No '{header}' found in {self.path}")
+        # Q-Chem format:
+        #          Atom    Charge (a.u.)
+        #     ----------------------------
+        #         1 C     -0.123456
+        rows: list[dict] = []
+        started = False
+        for line in self._lines[idx + 1: idx + 4000]:
+            if line.strip().startswith("---"):
+                started = True
+                continue
+            if not started:
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                if rows:
+                    break
+                continue
+            try:
+                a_idx = int(parts[0])
+                charge = float(parts[2])
+            except (ValueError, IndexError):
+                if rows:
+                    break
+                continue
+            rows.append({
+                "atom_index": a_idx,
+                "element": parts[1],
+                "charge": charge,
+            })
+        if not rows:
+            raise ValueError(f"Empty charge block '{header}' in {self.path}")
+        return rows
+
+    def get_mulliken_charges(self) -> list[dict]:
+        return self._parse_qchem_charge_block("Ground-State Mulliken Net Atomic Charges")
+
+    def get_chelpg_charges(self) -> list[dict]:
+        return self._parse_qchem_charge_block("Ground-State ChElPG Net Atomic Charges")
+
+    def get_hirshfeld_charges(self) -> list[dict]:
+        return self._parse_qchem_charge_block("Hirshfeld Atomic Charges")
+
+    def get_energy(self) -> float:
+        pattern = re.compile(r"Total energy in the final basis set\s*=\s*([-.\d]+)")
+        matches = pattern.findall(self._text)
+        if matches:
+            return float(matches[-1])
+        # Fallback: SCF energy
+        pattern = re.compile(r"SCF\s+energy\s*=\s*([-.\d]+)")
+        matches = pattern.findall(self._text)
+        if matches:
+            return float(matches[-1])
+        raise ValueError(f"No total energy found in {self.path}")
 
 
 # ---------------------------------------------------------------------------
@@ -584,14 +883,68 @@ def auto_parse(path: str | Path) -> dict:
             try:
                 npa = parser.get_npa_charges()
                 if npa:
-                    result["atoms"] = [
-                        {"atom_index": r["atom_index"], "element": r["element"],
-                         "x": 0.0, "y": 0.0, "z": 0.0}
-                        for r in npa
-                    ]
-                    result.setdefault("charges", {})["npa"] = npa
+                    # NBO standalone files have no geometry; expose NPA under
+                    # *both* the canonical 'npa' key and the legacy 'nbo' alias
+                    # so CLI users can switch between Gaussian/ORCA + NBO files
+                    # without changing --charge-scheme. Atoms remain empty:
+                    # callers must provide geometry via --xyz.
+                    charges = result.setdefault("charges", {})
+                    charges["npa"] = npa
+                    charges["nbo"] = npa
+                    result["atoms"] = []
+                    result["needs_geometry"] = True
             except ValueError:
                 pass
+            result["parser"] = parser
+            return result
+
+        head = text[:4000]
+
+        # Q-Chem detection
+        if "Q-Chem" in head or "Welcome to Q-Chem" in head:
+            parser = QchemOutputParser(path)
+            result["format"] = "qchem"
+            result["atoms"] = parser.get_geometry()
+            try:
+                result["energy"] = parser.get_energy()
+            except ValueError:
+                pass
+            charges = result.setdefault("charges", {})
+            for method, getter in [
+                ("mulliken", parser.get_mulliken_charges),
+                ("chelpg", parser.get_chelpg_charges),
+                ("hirshfeld", parser.get_hirshfeld_charges),
+            ]:
+                try:
+                    rows = getter()
+                    if rows:
+                        charges[method] = rows
+                except ValueError:
+                    pass
+            result["parser"] = parser
+            return result
+
+        # NWChem detection
+        if "Northwest Computational Chemistry Package" in head or "NWChem" in head:
+            parser = NwchemOutputParser(path)
+            result["format"] = "nwchem"
+            result["atoms"] = parser.get_geometry()
+            try:
+                result["energy"] = parser.get_energy()
+            except ValueError:
+                pass
+            charges = result.setdefault("charges", {})
+            for method, getter in [
+                ("mulliken", parser.get_mulliken_charges),
+                ("chelpg", parser.get_esp_charges),
+                ("loewdin", parser.get_lowdin_charges),
+            ]:
+                try:
+                    rows = getter()
+                    if rows:
+                        charges[method] = rows
+                except ValueError:
+                    pass
             result["parser"] = parser
             return result
 
@@ -605,6 +958,7 @@ def auto_parse(path: str | Path) -> dict:
             except ValueError:
                 pass
             # Try to get charges
+            charges = result.setdefault("charges", {})
             for method, getter in [
                 ("mulliken", parser.get_mulliken_charges),
                 ("apt", parser.get_apt_charges),
@@ -612,11 +966,21 @@ def auto_parse(path: str | Path) -> dict:
                 ("chelpg", parser.get_chelpg_charges),
             ]:
                 try:
-                    charges = getter()
-                    if charges:
-                        result.setdefault("charges", {})[method] = charges
+                    rows = getter()
+                    if rows:
+                        charges[method] = rows
                 except ValueError:
                     pass
+            # NBO and NPA are the same numbers in Gaussian's NPA block —
+            # expose both keys so users can pick either name on the CLI.
+            if "nbo" in charges and "npa" not in charges:
+                charges["npa"] = charges["nbo"]
+            try:
+                spin = parser.get_mulliken_spin_populations()
+                if spin:
+                    result.setdefault("spin_populations", {})["mulliken"] = spin
+            except ValueError:
+                pass
             result["parser"] = parser
         else:
             # Assume ORCA
@@ -636,6 +1000,16 @@ def auto_parse(path: str | Path) -> dict:
                     charges = getter()
                     if charges:
                         result.setdefault("charges", {})[method] = charges
+                except ValueError:
+                    pass
+            for method, getter in [
+                ("mulliken", parser.get_mulliken_spin_populations),
+                ("loewdin", parser.get_loewdin_spin_populations),
+            ]:
+                try:
+                    spin = getter()
+                    if spin:
+                        result.setdefault("spin_populations", {})[method] = spin
                 except ValueError:
                     pass
             try:

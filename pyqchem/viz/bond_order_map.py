@@ -13,9 +13,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colormaps
 from matplotlib.colors import Normalize
-from matplotlib.patches import Circle, FancyArrowPatch
+from matplotlib.patches import Circle
 
-from ._geometry import build_bonds, project_2d
+from ._geometry import project_2d
 from ._style import (
     DEFAULT_DPI,
     get_display_radius,
