@@ -285,6 +285,43 @@ def _cmd_traj(args: argparse.Namespace) -> None:
     print(f"Saved: {args.output}")
 
 
+def _cmd_homo_lumo(args: argparse.Namespace) -> None:
+    import numpy as np
+    from ._parsers import auto_parse
+    from .homo_lumo import render_homo_lumo_diagram
+
+    path   = Path(args.input_file)
+    result = auto_parse(path)
+    fmt    = result.get("format", "unknown")
+    parser = result.get("parser")
+
+    energies = result.get("orbital_energies_hartree")
+    n_occ    = result.get("n_occ")
+
+    if energies is None or n_occ is None:
+        raise ValueError(
+            f"Cannot extract orbital energies from {fmt!r} file.\n"
+            "Supported: Gaussian .log/.fchk, ORCA .out, Molden .molden"
+        )
+
+    desc = render_homo_lumo_diagram(
+        energies, n_occ, Path(args.output),
+        n_window=args.n_window,
+        title=args.title or path.stem,
+        dpi=args.dpi,
+    )
+
+    print(f"Saved: {args.output}")
+    print()
+    print(f"  HOMO = {desc['homo_ev']:+.4f} eV  ({desc['homo_hartree']:+.8f} Eh)")
+    print(f"  LUMO = {desc['lumo_ev']:+.4f} eV  ({desc['lumo_hartree']:+.8f} Eh)")
+    print(f"  Gap  = {desc['gap_ev']:.4f} eV")
+    print()
+    print(f"  Koopmans': IP = {desc['ip_ev']:.4f} eV,  EA = {desc['ea_ev']:.4f} eV")
+    print(f"  mu = {desc['mu_ev']:+.4f} eV,  eta = {desc['eta_ev']:.4f} eV")
+    print(f"  omega = {desc['omega_ev']:.4f} eV,  S = {desc['softness_per_ev']:.4f} eV^-1")
+
+
 def _cmd_auto(args: argparse.Namespace) -> None:
     from ._parsers import auto_parse
 
@@ -306,6 +343,15 @@ def _cmd_auto(args: argparse.Namespace) -> None:
         print(f"Spin:    {', '.join(sorted(result['spin_populations'].keys()))}")
     if "bond_orders" in result:
         print(f"Bond orders: {len(result['bond_orders'])} significant bonds")
+    if "orbital_energies_hartree" in result:
+        e   = result["orbital_energies_hartree"]
+        occ = result["n_occ"]
+        from .homo_lumo import compute_homo_lumo_descriptors, HARTREE_TO_EV
+        desc = compute_homo_lumo_descriptors(e, occ)
+        print(f"Orbitals: {len(e)} ({occ} occupied, {len(e)-occ} virtual)")
+        print(f"HOMO:     {desc['homo_ev']:+.4f} eV  ({desc['homo_hartree']:+.8f} Eh)")
+        print(f"LUMO:     {desc['lumo_ev']:+.4f} eV  ({desc['lumo_hartree']:+.8f} Eh)")
+        print(f"Gap:      {desc['gap_ev']:.4f} eV")
     if "cube" in result:
         shape = result["cube"]["shape"]
         print(f"Grid:    {shape[0]}x{shape[1]}x{shape[2]}")
@@ -478,6 +524,24 @@ def main(argv: list[str] | None = None) -> None:
     p_traj.add_argument("--title", default="")
     _add_dpi(p_traj)
     p_traj.set_defaults(func=_cmd_traj)
+
+    # --- homo-lumo ---
+    p_hl = sub.add_parser(
+        "homo-lumo",
+        help="HOMO/LUMO analysis: energy level diagram + chemical reactivity descriptors.",
+    )
+    p_hl.add_argument(
+        "--input-file", required=True,
+        help="Gaussian .log/.fchk, ORCA .out, or Molden .molden file.",
+    )
+    p_hl.add_argument("--output", required=True, help="Output image path (PNG/SVG/PDF).")
+    p_hl.add_argument(
+        "--n-window", type=int, default=5,
+        help="Extra orbitals to show above LUMO and below HOMO (default: 5).",
+    )
+    p_hl.add_argument("--title", default="", help="Figure title (molecule/method).")
+    _add_dpi(p_hl)
+    p_hl.set_defaults(func=_cmd_homo_lumo)
 
     # --- auto ---
     p_auto = sub.add_parser("auto", help="Auto-detect file format and show available data.")

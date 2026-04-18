@@ -129,28 +129,54 @@ class GaussianLogParser:
 
     def get_nbo_charges(self) -> list[dict]:
         """Extract NBO natural charges from Natural Population Analysis."""
-        pattern = re.compile(
-            r"Summary of Natural Population Analysis:.*?\n"
-            r"\s*-+\n"
-            r"\s*Atom\s+No\s+.*?\n"
-            r"\s*-+\n"
-            r"(.*?)\n"
-            r"\s*[=]+",
-            re.DOTALL,
-        )
-        match = pattern.search(self._text)
-        if not match:
+        # Different Gaussian / NBO versions interleave a variable number of
+        # header lines between "Summary of Natural Population Analysis:" and
+        # the dashed separator that precedes the data. Locate the header line
+        # ("Atom  No    Charge") instead of relying on a strict regex shape.
+        idx = None
+        for i, line in enumerate(self._lines):
+            if "Summary of Natural Population Analysis" in line:
+                idx = i
+                break
+        if idx is None:
             raise ValueError(f"No NBO charges found in {self.path}")
-        rows = []
-        for line in match.group(1).strip().splitlines():
-            parts = line.split()
-            if len(parts) < 3:
+        # Find the column header within the next ~10 lines
+        header_idx = None
+        for j in range(idx + 1, min(idx + 12, len(self._lines))):
+            line = self._lines[j]
+            if "Atom" in line and "No" in line and "Charge" in line:
+                header_idx = j
+                break
+        if header_idx is None:
+            raise ValueError(f"No NBO charge header found in {self.path}")
+        # Skip the dashed separator line right after the header
+        start = header_idx + 1
+        if start < len(self._lines) and set(self._lines[start].strip()) <= {"-", " "}:
+            start += 1
+        rows: list[dict] = []
+        for line in self._lines[start:]:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("=") or stripped.startswith("---"):
+                if rows:
+                    break
                 continue
-            rows.append({
-                "atom_index": int(parts[1]),
-                "element": parts[0],
-                "charge": float(parts[2]),
-            })
+            parts = stripped.split()
+            if len(parts) < 3:
+                if rows:
+                    break
+                continue
+            try:
+                rows.append({
+                    "atom_index": int(parts[1]),
+                    "element": parts[0],
+                    "charge": float(parts[2]),
+                })
+            except (ValueError, IndexError):
+                if rows:
+                    break
+                continue
+        if not rows:
+            raise ValueError(f"No NBO rows parsed from {self.path}")
         return rows
 
     def get_chelpg_charges(self) -> list[dict]:
@@ -159,6 +185,31 @@ class GaussianLogParser:
         return self._parse_charge_block(
             "Charges from ESP fit", skip_header=2,
         )
+
+    def get_orbital_energies(self) -> tuple[np.ndarray, int]:
+        """Extract alpha orbital energies from 'eigenvalues' print lines.
+
+        Returns
+        -------
+        (energies_hartree, n_occ) — full orbital energy array in Hartree
+        and the number of occupied orbitals.
+        """
+        occ_vals: list[float] = []
+        virt_vals: list[float] = []
+        occ_re  = re.compile(r"Alpha\s+occ\.\s+eigenvalues\s+--\s+(.*)")
+        virt_re = re.compile(r"Alpha\s+virt\.\s+eigenvalues\s+--\s+(.*)")
+        for line in self._lines:
+            m = occ_re.search(line)
+            if m:
+                occ_vals.extend(float(v) for v in m.group(1).split())
+                continue
+            m = virt_re.search(line)
+            if m:
+                virt_vals.extend(float(v) for v in m.group(1).split())
+        if not occ_vals:
+            raise ValueError(f"No orbital eigenvalues found in {self.path}")
+        energies = np.array(occ_vals + virt_vals, dtype=float)
+        return energies, len(occ_vals)
 
     def get_energy(self) -> float:
         """Extract the last SCF energy (Hartree)."""
@@ -291,6 +342,13 @@ class FchkParser:
     def get_alpha_orbital_energies(self) -> np.ndarray:
         """Return alpha orbital energies (Hartree)."""
         return self._read_array("Alpha Orbital Energies")
+
+    def get_n_alpha_electrons(self) -> int:
+        """Return number of alpha electrons (= n_occ for closed-shell RHF)."""
+        try:
+            return int(self._read_scalar("Number of alpha electrons"))
+        except KeyError:
+            return self.get_n_electrons() // 2
 
     def get_total_energy(self) -> float:
         return float(self._read_scalar("Total Energy"))
@@ -451,6 +509,51 @@ class OrcaOutputParser:
                         "bond_order": bo,
                     })
         return rows
+
+    def get_orbital_energies(self) -> tuple[np.ndarray, int]:
+        """Extract orbital energies from the ORBITAL ENERGIES block.
+
+        Returns
+        -------
+        (energies_hartree, n_occ) — full array in Hartree and count of
+        occupied orbitals (OCC > 0.5).
+        """
+        # Take the last ORBITAL ENERGIES block (final SCF iteration)
+        block_start = None
+        for i, line in enumerate(self._lines):
+            if "ORBITAL ENERGIES" in line:
+                block_start = i
+        if block_start is None:
+            raise ValueError(f"No ORBITAL ENERGIES section found in {self.path}")
+
+        # Locate the data header "E(Eh)"
+        data_start = None
+        for j in range(block_start, min(block_start + 12, len(self._lines))):
+            if "E(Eh)" in self._lines[j]:
+                data_start = j + 1
+                break
+        if data_start is None:
+            raise ValueError(f"Could not locate orbital energy table in {self.path}")
+
+        energies: list[float] = []
+        occs: list[float] = []
+        for line in self._lines[data_start:]:
+            parts = line.split()
+            if len(parts) < 3:
+                if energies:
+                    break
+                continue
+            try:
+                int(parts[0])           # orbital index (0-based)
+                occs.append(float(parts[1]))
+                energies.append(float(parts[2]))
+            except (ValueError, IndexError):
+                if energies:
+                    break
+        if not energies:
+            raise ValueError(f"Empty orbital energy table in {self.path}")
+        n_occ = sum(1 for o in occs if o > 0.5)
+        return np.array(energies, dtype=float), n_occ
 
     def get_energy(self) -> float:
         """Extract final total energy (Hartree)."""
@@ -865,12 +968,27 @@ def auto_parse(path: str | Path) -> dict:
         result["format"] = "gaussian_fchk"
         result["atoms"] = parser.get_geometry()
         result["energy"] = parser.get_total_energy()
+        try:
+            energies = parser.get_alpha_orbital_energies()
+            n_occ    = parser.get_n_alpha_electrons()
+            result["orbital_energies_hartree"] = energies
+            result["n_occ"] = n_occ
+        except (KeyError, ValueError):
+            pass
         result["parser"] = parser
 
     elif suffix in (".molden", ".molf"):
         parser = MoldenParser(path)
         result["format"] = "molden"
         result["atoms"] = parser.get_geometry()
+        try:
+            mo_e = parser.get_mo_energies()
+            mo_o = parser.get_mo_occupations()
+            if mo_e and mo_o:
+                result["orbital_energies_hartree"] = np.array(mo_e, dtype=float)
+                result["n_occ"] = sum(1 for o in mo_o if o > 0.5)
+        except (ValueError, IndexError):
+            pass
         result["parser"] = parser
 
     elif suffix in (".log", ".out", ".g09", ".g16"):
@@ -981,6 +1099,12 @@ def auto_parse(path: str | Path) -> dict:
                     result.setdefault("spin_populations", {})["mulliken"] = spin
             except ValueError:
                 pass
+            try:
+                energies, n_occ = parser.get_orbital_energies()
+                result["orbital_energies_hartree"] = energies
+                result["n_occ"] = n_occ
+            except ValueError:
+                pass
             result["parser"] = parser
         else:
             # Assume ORCA
@@ -1014,6 +1138,12 @@ def auto_parse(path: str | Path) -> dict:
                     pass
             try:
                 result["bond_orders"] = parser.get_mayer_bond_orders()
+            except ValueError:
+                pass
+            try:
+                energies, n_occ = parser.get_orbital_energies()
+                result["orbital_energies_hartree"] = energies
+                result["n_occ"] = n_occ
             except ValueError:
                 pass
             result["parser"] = parser

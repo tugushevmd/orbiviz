@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any
 # Mapping of public name -> (submodule, attribute)
 _LAZY: dict[str, tuple[str, str]] = {
     # Always available (NumPy + Matplotlib only)
+    "render_homo_lumo_diagram":       (".homo_lumo", "render_homo_lumo_diagram"),
+    "compute_homo_lumo_descriptors":  (".homo_lumo", "compute_homo_lumo_descriptors"),
     "render_ranked_charge_map": (".charge_map", "render_ranked_charge_map"),
     "render_spin_density_map": (".charge_map", "render_spin_density_map"),
     "render_charge_difference_map": (".charge_map", "render_charge_difference_map"),
@@ -76,6 +78,7 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .homo_lumo import render_homo_lumo_diagram, compute_homo_lumo_descriptors
     from .charge_map import (
         render_ranked_charge_map,
         render_spin_density_map,
